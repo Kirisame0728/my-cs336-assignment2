@@ -7,6 +7,7 @@ import timeit
 import statistics
 import pandas as pd
 import torch.cuda.nvtx as nvtx
+import os
 
 MODEL_CONFIGS = {
     "small": {"d_model": 768,  "d_ff": 3072,  "num_layers": 12, "num_heads": 12},
@@ -30,6 +31,11 @@ def parse_args():
     parser.add_argument("--rope_theta", type=float, default=10000.0)
     parser.add_argument("--mixed_precision", action="store_true")
     parser.add_argument("--mp_dtype", type=str, default="bf16", choices=["bf16"])
+
+    parser.add_argument("--profile_memory", action="store_true")
+    parser.add_argument("--snapshot_path", type=str, default="memory_snapshot.pickle")
+
+
     return parser.parse_args()
 
 def get_amp_context(args):
@@ -76,23 +82,23 @@ def run_forward_backward(model, optimizer, x, y, vocab_size, args):
         optimizer.step()
         torch.cuda.synchronize()
 
-def benchmark(args):
-    assert torch.cuda.is_available(), "CUDA is required for this benchmark."
-    model = make_model(args)
-    if args.mode == "train":
-        model.train()
-    else:
-        model.eval()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr) if args.mode == "train" else None
-    x, y = generate_data(args)
-
-    torch.cuda.synchronize()
-    with nvtx.range("warmup"):
-        for _ in range(args.warmup_steps):
-            if args.mode == "train":
-                run_forward_backward(model, optimizer, x, y, args.vocab_size, args)
-            else:
-                run_forward(model, x, args)
+def benchmark(args, model, optimizer, x, y):
+    # assert torch.cuda.is_available(), "CUDA is required for this benchmark."
+    # model = make_model(args)
+    # if args.mode == "train":
+    #     model.train()
+    # else:
+    #     model.eval()
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr) if args.mode == "train" else None
+    # x, y = generate_data(args)
+    #
+    # torch.cuda.synchronize()
+    # with nvtx.range("warmup"):
+    #     for _ in range(args.warmup_steps):
+    #         if args.mode == "train":
+    #             run_forward_backward(model, optimizer, x, y, args.vocab_size, args)
+    #         else:
+    #             run_forward(model, x, args)
     times = []
     with nvtx.range("measured_region"):
         for i in range(args.measure_steps):
@@ -122,9 +128,74 @@ def benchmark(args):
     print("Summary:")
     print(summary_df.to_markdown(index=False))
 
+
+def run_warmup(model, optimizer, x, y, args):
+    with nvtx.range("warmup"):
+        for _ in range(args.warmup_steps):
+            if args.mode == "train":
+                run_forward_backward(model, optimizer, x, y, args.vocab_size, args)
+            else:
+                run_forward(model, x, args)
+
+def profile_memory(args, model, optimizer, x, y):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    snapshot_dir = os.path.dirname(args.snapshot_path)
+    if snapshot_dir:
+        os.makedirs(snapshot_dir, exist_ok=True)
+
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
+
+    try:
+        with nvtx.range("memory_profiled_region"):
+            if args.mode == "train":
+                run_forward_backward(model, optimizer, x, y, args.vocab_size, args)
+            else:
+                run_forward(model, x, args)
+
+        torch.cuda.synchronize()
+        torch.cuda.memory._dump_snapshot(args.snapshot_path)
+
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+    peak_allocated = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+
+    summary_df = pd.DataFrame([
+        {
+            "task": "memory_profile",
+            "mode": args.mode,
+            "model_size": args.model_size,
+            "seq_len": args.seq_len,
+            "mixed_precision": args.mixed_precision,
+            "peak_allocated_mb": peak_allocated / (1024 ** 2),
+            "peak_reserved_mb": peak_reserved / (1024 ** 2),
+            "snapshot_path": args.snapshot_path,
+        }
+    ])
+    print("Memory Summary:")
+    print(summary_df.to_markdown(index=False))
+
 def main():
     args = parse_args()
-    benchmark(args)
+    assert torch.cuda.is_available(), "CUDA is required for this benchmark."
+    model = make_model(args)
+    if args.mode == "train":
+        model.train()
+    else:
+        model.eval()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr) if args.mode == "train" else None
+    x, y = generate_data(args)
+    run_warmup(model, optimizer, x, y, args)
+    if args.profile_memory:
+        profile_memory(args, model, optimizer, x, y)
+    else:
+        benchmark(args, model, optimizer, x, y)
+
+
 
 if __name__ == "__main__":
     main()
