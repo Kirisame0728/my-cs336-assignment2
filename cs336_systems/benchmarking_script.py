@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import timeit
 import statistics
 import pandas as pd
+import torch.cuda.nvtx as nvtx
 
 MODEL_CONFIGS = {
     "small": {"d_model": 768,  "d_ff": 3072,  "num_layers": 12, "num_heads": 12},
@@ -44,14 +45,27 @@ def make_model(args):
     return model
 
 def run_forward(model, x):
-    with torch.no_grad():
-        _ = model(x)
+    with nvtx.range("forward"):
+        with torch.no_grad():
+            _ = model(x)
+        torch.cuda.synchronize()
+
 
 def run_forward_backward(model, optimizer, x, y, vocab_size):
     optimizer.zero_grad(set_to_none=True)
-    outputs = model(x)
+    with nvtx.range("forward"):
+        outputs = model(x)
+        torch.cuda.synchronize()
+
     loss = F.cross_entropy(outputs.reshape(-1, vocab_size), y.reshape(-1))
-    loss.backward()
+
+    with nvtx.range("backward"):
+        loss.backward()
+        torch.cuda.synchronize()
+
+    with nvtx.range("optimizer_step"):
+        optimizer.step()
+        torch.cuda.synchronize()
 
 def benchmark(args):
     assert torch.cuda.is_available(), "CUDA is required for this benchmark."
@@ -64,22 +78,23 @@ def benchmark(args):
     x, y = generate_data(args)
 
     torch.cuda.synchronize()
-    for _ in range(args.warmup_steps):
-        if args.mode == "train":
-            run_forward_backward(model, optimizer, x, y, args.vocab_size)
-        else:
-            run_forward(model, x)
-        torch.cuda.synchronize()
+    with nvtx.range("warmup"):
+        for _ in range(args.warmup_steps):
+            if args.mode == "train":
+                run_forward_backward(model, optimizer, x, y, args.vocab_size)
+            else:
+                run_forward(model, x)
     times = []
-    for _ in range(args.measure_steps):
-        start = timeit.default_timer()
-        if args.mode == "train":
-            run_forward_backward(model, optimizer, x, y, args.vocab_size)
-        else:
-            run_forward(model, x)
-        torch.cuda.synchronize()
-        end = timeit.default_timer()
-        times.append(end - start)
+    with nvtx.range("measured_region"):
+        for i in range(args.measure_steps):
+            start = timeit.default_timer()
+            with nvtx.range(f"measure_step_{i}"):
+                if args.mode == "train":
+                    run_forward_backward(model, optimizer, x, y, args.vocab_size)
+                else:
+                    run_forward(model, x)
+            end = timeit.default_timer()
+            times.append(end - start)
     mean_t = statistics.mean(times)
     std_t = statistics.stdev(times)
 
@@ -87,9 +102,7 @@ def benchmark(args):
         {
             "mode": args.mode,
             "model_size": args.model_size,
-            "batch_size": args.batch_size,
             "seq_len": args.seq_len,
-            "vocab_size": args.vocab_size,
             "warmup_steps": args.warmup_steps,
             "measure_steps": args.measure_steps,
             "mean_ms": mean_t * 1000,
