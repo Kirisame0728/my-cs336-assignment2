@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import torch
 import argparse
 from cs336_basics.model import BasicsTransformerLM
@@ -27,7 +28,14 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--rope_theta", type=float, default=10000.0)
+    parser.add_argument("--mixed_precision", action="store_true")
+    parser.add_argument("--mp_dtype", type=str, default="bf16", choices=["bf16"])
     return parser.parse_args()
+
+def get_amp_context(args):
+    if args.mixed_precision:
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 def generate_data(args):
     x = torch.randint(0, args.vocab_size, (args.batch_size, args.seq_len), device=args.device, dtype=torch.long)
@@ -44,20 +52,21 @@ def make_model(args):
     model = BasicsTransformerLM(args.vocab_size, args.seq_len, d_model, num_layers, num_heads, d_ff, args.rope_theta).to(args.device)
     return model
 
-def run_forward(model, x):
+def run_forward(model, x, args):
     with nvtx.range("forward"):
         with torch.no_grad():
-            _ = model(x)
+            with get_amp_context(args):
+                _ = model(x)
         torch.cuda.synchronize()
 
 
-def run_forward_backward(model, optimizer, x, y, vocab_size):
+def run_forward_backward(model, optimizer, x, y, vocab_size, args):
     optimizer.zero_grad(set_to_none=True)
-    with nvtx.range("forward"):
-        outputs = model(x)
+    with get_amp_context(args):
+        with nvtx.range("forward"):
+            outputs = model(x)
+            loss = F.cross_entropy(outputs.reshape(-1, vocab_size), y.reshape(-1))
         torch.cuda.synchronize()
-
-    loss = F.cross_entropy(outputs.reshape(-1, vocab_size), y.reshape(-1))
 
     with nvtx.range("backward"):
         loss.backward()
@@ -81,18 +90,18 @@ def benchmark(args):
     with nvtx.range("warmup"):
         for _ in range(args.warmup_steps):
             if args.mode == "train":
-                run_forward_backward(model, optimizer, x, y, args.vocab_size)
+                run_forward_backward(model, optimizer, x, y, args.vocab_size, args)
             else:
-                run_forward(model, x)
+                run_forward(model, x, args)
     times = []
     with nvtx.range("measured_region"):
         for i in range(args.measure_steps):
             start = timeit.default_timer()
             with nvtx.range(f"measure_step_{i}"):
                 if args.mode == "train":
-                    run_forward_backward(model, optimizer, x, y, args.vocab_size)
+                    run_forward_backward(model, optimizer, x, y, args.vocab_size, args)
                 else:
-                    run_forward(model, x)
+                    run_forward(model, x, args)
             end = timeit.default_timer()
             times.append(end - start)
     mean_t = statistics.mean(times)
@@ -105,6 +114,7 @@ def benchmark(args):
             "seq_len": args.seq_len,
             "warmup_steps": args.warmup_steps,
             "measure_steps": args.measure_steps,
+            "mixed_precision": args.mixed_precision,
             "mean_ms": mean_t * 1000,
             "std_ms": std_t * 1000,
         }
