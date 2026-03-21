@@ -15,27 +15,27 @@ def pytorch_attention(q, k, v, d):
     out = attn @ v
     return out
 
-def time_forward(batch_size, seq_len, d_model, device, num_passes=100):
+
+def time_forward(batch_size, seq_len, d_model, device, model, num_passes=100):
     q, k, v = make_qkv(batch_size, seq_len, d_model, device)
     with torch.no_grad():
         for _ in range(5):
-            _ = pytorch_attention(q, k, v, d_model)
+            _ = model(q, k, v, d_model)
             torch.cuda.synchronize()
-
         times = []
         for _ in range(num_passes):
             start = timeit.default_timer()
-            _ = pytorch_attention(q, k, v, d_model)
+            _ = model(q, k, v, d_model)
             torch.cuda.synchronize()
             end = timeit.default_timer()
             times.append((end - start) * 1000)
     return statistics.mean(times), (statistics.stdev(times) if len(times) > 1 else 0.0)
 
-def memory_before_backward(batch_size, seq_len, d_model, device):
+def memory_before_backward(batch_size, seq_len, d_model, model, device):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     q, k, v = make_qkv(batch_size, seq_len, d_model, device)
-    out = pytorch_attention(q, k, v, d_model)
+    out = model(q, k, v, d_model)
     loss = out.sum()
     torch.cuda.synchronize()
     mem_allocated = torch.cuda.memory_allocated(device)
@@ -48,13 +48,13 @@ def memory_before_backward(batch_size, seq_len, d_model, device):
 
     return mem_allocated / (1024 ** 2), peak_allocated / (1024 ** 2)
 
-def time_backward(batch_size, seq_len, d_model, device, num_passes=100):
+def time_backward(batch_size, seq_len, d_model, device, model, num_passes=100):
     q, k, v = make_qkv(batch_size, seq_len, d_model, device)
     for _ in range(5):
         if q.grad is not None: q.grad = None
         if k.grad is not None: k.grad = None
         if v.grad is not None: v.grad = None
-        out = pytorch_attention(q, k, v, d_model)
+        out = model(q, k, v, d_model)
         loss = out.sum()
         loss.backward()
         torch.cuda.synchronize()
@@ -66,7 +66,7 @@ def time_backward(batch_size, seq_len, d_model, device, num_passes=100):
         if v.grad is not None: v.grad = None
 
         start = timeit.default_timer()
-        out = pytorch_attention(q, k, v, d_model)
+        out = model(q, k, v, d_model)
         loss = out.sum()
         loss.backward()
         torch.cuda.synchronize()
@@ -74,7 +74,7 @@ def time_backward(batch_size, seq_len, d_model, device, num_passes=100):
         times.append((end - start) * 1000)
     return statistics.mean(times), (statistics.stdev(times) if len(times) > 1 else 0.0)
 
-def benchmark(batch_size, seq_len, d_model, device, num_passes=100):
+def benchmark(batch_size, seq_len, d_model, device, model, num_passes=100):
     result = {
         "d_model": d_model,
         "seq_len": seq_len,
@@ -86,11 +86,12 @@ def benchmark(batch_size, seq_len, d_model, device, num_passes=100):
         "backward_std_ms": None,
         "status": "ok",
         "OOM_stage": None,
+        "variant": None,
     }
     try:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        fwd_time_mean, fwd_time_std = time_forward(batch_size, seq_len, d_model, device, num_passes)
+        fwd_time_mean, fwd_time_std = time_forward(batch_size, seq_len, d_model, device, model, num_passes)
         result["forward_mean_ms"] = fwd_time_mean
         result["forward_std_ms"] = fwd_time_std
     except torch.cuda.OutOfMemoryError:
@@ -102,14 +103,14 @@ def benchmark(batch_size, seq_len, d_model, device, num_passes=100):
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             result["status"] = "OOM"
-            result["oom_stage"] = "forward"
+            result["OOM_stage"] = "forward"
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             return result
         raise
 
     try:
-        memory, peak = memory_before_backward(batch_size, seq_len, d_model, device)
+        memory, peak = memory_before_backward(batch_size, seq_len, d_model, model, device)
         result["forward_memory"] = memory
         result["forward_peak_mem"] = peak
     except torch.cuda.OutOfMemoryError:
@@ -130,7 +131,7 @@ def benchmark(batch_size, seq_len, d_model, device, num_passes=100):
     try:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        bwd_mean, bwd_std = time_backward(batch_size, seq_len, d_model, device, num_passes)
+        bwd_mean, bwd_std = time_backward(batch_size, seq_len, d_model, device, model, num_passes)
         result["backward_mean_ms"] = bwd_mean
         result["backward_std_ms"] = bwd_std
     except torch.cuda.OutOfMemoryError:
@@ -158,20 +159,24 @@ def main():
     device = "cuda"
     assert torch.cuda.is_available(), "CUDA is required for this benchmark."
     results = []
-    total = len(d_models) * len(seq_lens)
+    eager_attention = pytorch_attention
+    compiled_attn = torch.compile(pytorch_attention)
+    models = [("eager", eager_attention), ("compiled", compiled_attn)]
+    total = len(d_models) * len(seq_lens) * len(models)
     idx = 0
     for d_model in d_models:
         for seq_len in seq_lens:
-            idx += 1
-            print(f"[{idx}/{total}] Running seq_len={seq_len}, d_model={d_model}")
-            result = benchmark(b_size, seq_len, d_model, device, num_passes=100)
-            results.append(result)
-            df = pd.DataFrame(results)
-            print(df.to_markdown(index=False))
+            for variant_name, model in models:
+                idx += 1
+                print(f"[{idx}/{total}] Running seq_len={seq_len}, d_model={d_model}")
+                result = benchmark(b_size, seq_len, d_model, device, model, num_passes=100)
+                result["variant"] = variant_name
+                results.append(result)
+                df = pd.DataFrame(results)
+                print(df.to_markdown(index=False))
     print("\nFinal results:")
     df = pd.DataFrame(results)
     print(df.to_markdown(index=False))
 
 if __name__ == "__main__":
     main()
-
