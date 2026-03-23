@@ -56,7 +56,7 @@ def time_backward(batch_size, seq_len, d_model, device, model, num_passes=100):
         if v.grad is not None: v.grad = None
         out = model(q, k, v, d_model)
         loss = out.sum()
-        loss.backward()
+        loss.backward(,
         torch.cuda.synchronize()
 
     times = []
@@ -68,7 +68,7 @@ def time_backward(batch_size, seq_len, d_model, device, model, num_passes=100):
         start = timeit.default_timer()
         out = model(q, k, v, d_model)
         loss = out.sum()
-        loss.backward()
+        loss.backward(,
         torch.cuda.synchronize()
         end = timeit.default_timer()
         times.append((end - start) * 1000)
