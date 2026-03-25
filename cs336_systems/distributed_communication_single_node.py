@@ -79,7 +79,7 @@ def all_reduce_benchmark(rank, world_size, backend, size, warmup_iters, measure_
     cleanup()
 
 def run_exps(
-    backends=("nccl",),
+    backends=("gloo",),
     world_sizes=(2, 4, 6),
     sizes=(1 * MB, 10 * MB, 100 * MB, 1 * GB),
     warmup_iters=5,
