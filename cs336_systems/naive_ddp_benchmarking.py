@@ -69,6 +69,8 @@ def benchmark_ddp_main(rank, backend, world_size, x, y, return_dict):
     y = y[start_index: end_index].to(device)
 
     model = get_model(rank, backend)
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     # Warmup
     dist.barrier()
