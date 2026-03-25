@@ -6,6 +6,7 @@ import os
 import timeit
 import torch.nn.functional as F
 import torch.multiprocessing as mp
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 def cleanup():
     torch.distributed.destroy_process_group()
@@ -111,10 +112,20 @@ def run_training_step(model, optimizer, x, y, vocab_size, device, world_size):
     synchronize_if_needed(device)
     begin_sync = timeit.default_timer()
     # Sync gradients
-    for param in model.parameters():
-        if param.grad is not None:
-            dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.SUM)
-            param.grad /= world_size
+    # for param in model.parameters():
+    #     if param.grad is not None:
+    #         dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.SUM)
+    #         param.grad /= world_size
+
+    grads = [param.grad for param in model.parameters() if param.grad is not None]
+    flat_grads = _flatten_dense_tensors(grads)
+    dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
+    flat_grads /= world_size
+
+    synced_grads = _unflatten_dense_tensors(flat_grads, grads)
+    for grad, synced_grad in zip(grads, synced_grads):
+        grad.copy_(synced_grad)
+
     synchronize_if_needed(device)
     end_sync = timeit.default_timer()
 
